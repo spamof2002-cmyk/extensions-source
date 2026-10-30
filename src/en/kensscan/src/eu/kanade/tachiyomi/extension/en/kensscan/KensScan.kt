@@ -1,5 +1,8 @@
 package eu.kanade.tachiyomi.extension.en.kensscan
 
+import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -11,6 +14,7 @@ import keiyoushi.annotation.Source
 import keiyoushi.network.get
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
+import keiyoushi.utils.getPreferencesLazy
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -40,7 +44,31 @@ import java.util.Locale
  * No speculative image probes are performed; VIP entries are not filtered.
  */
 @Source
-abstract class KensScan : KeiSource() {
+abstract class KensScan :
+    KeiSource(),
+    ConfigurableSource {
+    private val preferences by getPreferencesLazy()
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_ALT_NAME_SEARCH
+            title = "Alternative-name search"
+            summary = "Search once during details fetch if alternative names are missing. Off prevents extra searches."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_RESEARCH_EXISTING_NAMES
+            title = "Re-search existing alternative names on details refresh"
+            summary = "Search again even if names are saved. Requires Alternative-name search to be on."
+            setDefaultValue(false)
+        }.also(screen::addPreference)
+    }
+
+    companion object {
+        private const val PREF_ALT_NAME_SEARCH = "kensscan_alt_names_first_fetch"
+        private const val PREF_RESEARCH_EXISTING_NAMES = "kensscan_alt_names_retry_details"
+    }
 
     private val seriesPath = Regex("^/manga/[^/]+/?$", RegexOption.IGNORE_CASE)
     private val chapterPath = Regex("^/manga/[^/]+/chapter-[^/]+/?$", RegexOption.IGNORE_CASE)
@@ -223,7 +251,7 @@ abstract class KensScan : KeiSource() {
     ): SMangaUpdate {
         // Single request for details and chapters; no duplicate fetch.
         val doc = client.get(getMangaUrl(manga)).asJsoup()
-        // Only a details fetch/refetch performs the additional name lookup.
+        // Only a details fetch/refetch can perform an alternative-title search.
         // Chapter-only updates keep the existing single request.
         val details = if (fetchDetails) detailWithSearchNames(doc, manga) else manga
         val resultChapters = if (fetchChapters) chaptersFromDocument(doc) else chapters
@@ -270,38 +298,74 @@ abstract class KensScan : KeiSource() {
         return emptyList()
     }
 
+    // The site's search cards display comma-separated names. Legacy saved
+    // descriptions may use commas, semicolons, bullets, or spaced middle dots.
+    private fun splitAlternativeNames(raw: String): List<String> = raw
+        .split(Regex("[,;|\\n]+|\\s+·\\s+"))
+        .map { it.trim().trim('-', '•', '*', '·', ' ') }
+        .filter { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
+        .distinctBy { it.lowercase(Locale.ROOT) }
+
+    // J2K indexes each bullet below a recognised alternative-title heading.
+    // A single comma-delimited line would otherwise be indexed as one alias.
+    private fun formatAlternativeNames(names: List<String>): String =
+        "Alternative Names:\n" + names.joinToString("\n") { "- $it" }
+
+    private val savedAlternativeHeader = Regex(
+        "(?im)^\\s*(?:alternative\\s+(?:titles?|names?)|alt\\s+titles?|other\\s+names?|associated\\s+names?|synonyms|also\\s+known\\s+as)\\s*[:：][ \\t]*",
+    )
+
+    private fun savedAlternativeNames(description: String?): List<String> {
+        val text = description.orEmpty()
+        val header = savedAlternativeHeader.find(text) ?: return emptyList()
+        val section = text.substring(header.range.last + 1).trimStart()
+            .substringBefore("\n\n")
+        return splitAlternativeNames(section)
+    }
+
+    private fun shouldSearchAlternativeNames(hasSavedNames: Boolean, isDetailsRefresh: Boolean): Boolean =
+        preferences.getBoolean(PREF_ALT_NAME_SEARCH, true) &&
+            (!hasSavedNames || (isDetailsRefresh && preferences.getBoolean(PREF_RESEARCH_EXISTING_NAMES, false)))
+
     private suspend fun detailWithSearchNames(doc: Document, oldManga: SManga? = null): SManga {
         val manga = detailFromDocument(doc)
-        if (manga.description.orEmpty().contains("Alternative Names:", ignoreCase = true)) return manga
+        val savedNames = savedAlternativeNames(oldManga?.description)
+        val pageNames = savedAlternativeNames(manga.description)
+        val allKnown = (pageNames + savedNames)
+            .filterNot { it.equals(manga.title, ignoreCase = true) }
+            .distinctBy { it.lowercase(Locale.ROOT) }
 
-        // One exact-title search, only at initial details fetch or details
-        // refetch. No catalogue scan and no lookup during chapter-only updates.
-        val names = try {
-            val query = URLEncoder.encode(manga.title, "UTF-8")
-            val searchDoc = client.get("$baseUrl/?s=$query&post_type=wp-manga&m_orderby=latest").asJsoup()
-            val path = getMangaUrl(manga).toHttpUrl().encodedPath
-            alternativeNamesFromSearchResult(searchDoc, path, manga.title)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
+        val shouldSearch = shouldSearchAlternativeNames(allKnown.isNotEmpty(), oldManga != null)
+        // If both switches are off, preserve saved titles without doing any
+        // search. No network request is made for chapter-only updates either.
+        val searched = if (shouldSearch) {
+            try {
+                val query = URLEncoder.encode(manga.title, "UTF-8")
+                val searchDoc = client.get("$baseUrl/?s=$query&post_type=wp-manga&m_orderby=latest").asJsoup()
+                val path = getMangaUrl(manga).toHttpUrl().encodedPath
+                alternativeNamesFromSearchResult(searchDoc, path, manga.title)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
+        } else {
             emptyList()
         }
 
-        if (names.isNotEmpty()) {
-            val section = "Alternative Names: ${names.joinToString("; ")}"
-            manga.description = listOfNotNull(manga.description?.takeIf { it.isNotBlank() }, section)
-                .joinToString("\n\n")
-        } else {
-            // A temporary site-search failure must not erase aliases saved by
-            // an earlier successful details refresh.
-            val previous = oldManga?.description.orEmpty().substringAfter("Alternative Names:", "")
-                .trim().takeIf { it.isNotBlank() }
-            if (previous != null) {
-                manga.description = listOfNotNull(
-                    manga.description?.takeIf { it.isNotBlank() },
-                    "Alternative Names: $previous",
-                ).joinToString("\n\n")
-            }
+        val finalNames = (allKnown + searched.flatMap(::splitAlternativeNames))
+            .filterNot { it.equals(manga.title, ignoreCase = true) }
+            .distinctBy { it.lowercase(Locale.ROOT) }
+        if (finalNames.isNotEmpty()) {
+            // Remove only the automatically generated alias block from the new
+            // details description; retain the synopsis and everything else.
+            val current = manga.description.orEmpty()
+            val header = savedAlternativeHeader.find(current)
+            val synopsis = if (header != null) current.substring(0, header.range.first).trimEnd() else current
+            manga.description = listOfNotNull(
+                synopsis.takeIf { it.isNotBlank() },
+                formatAlternativeNames(finalNames),
+            ).joinToString("\n\n")
         }
         return manga
     }
@@ -317,9 +381,7 @@ abstract class KensScan : KeiSource() {
                 Regex("(?i)^(?:alternative|alternate|other|alt)\\s+(?:names?|titles?)\\s*:\\s*"),
                 "",
             )
-            cleaned.split(Regex("[;|\\n]+")).map { it.trim().trim(',', '•', '-') }
-                .filter { it.isNotBlank() && it != "-" && it != "N/A" }
-                .forEach(values::add)
+            splitAlternativeNames(cleaned).forEach(values::add)
         }
 
         // Madara/WordPress details, including heading/value pairs.
@@ -331,8 +393,8 @@ abstract class KensScan : KeiSource() {
             }
         }
 
-        // Search result boxes commonly use plain text like
-        // <small>Alternative Names: Foo; Bar</small> rather than a details row.
+        // Search cards may use inline fields (for example, Alt Names: Foo, Bar)
+        // rather than the dedicated details rows.
         doc.select("span, small, p, div, li, b, strong").forEach { element ->
             val inline = inlineAlternativeNames.matchEntire(element.ownText().trim())
             if (inline != null) collect(inline.groupValues[1])
@@ -385,7 +447,7 @@ abstract class KensScan : KeiSource() {
         } else {
             listOfNotNull(
                 synopsis?.takeIf { it.isNotBlank() },
-                "Alternative Names: ${alternateNames.joinToString("; ")}",
+                formatAlternativeNames(alternateNames),
             ).joinToString("\n\n")
         }
         val text = doc.text()
