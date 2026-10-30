@@ -306,10 +306,10 @@ abstract class KensScan :
         .filter { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
         .distinctBy { it.lowercase(Locale.ROOT) }
 
-    // Display names with middle dots; accept comma- and bullet-separated
-    // existing descriptions through splitAlternativeNames when refreshing.
+    // Display one bullet per name; keep reading old comma- or dot-separated
+    // saved descriptions through splitAlternativeNames when refreshing.
     private fun formatAlternativeNames(names: List<String>): String =
-        "Alternative Names: " + names.joinToString(" · ")
+        "Alternative Names:\n" + names.joinToString("\n") { "• $it" }
 
     private val savedAlternativeHeader = Regex(
         "(?im)^\\s*(?:alternative\\s+(?:titles?|names?)|alt\\s+titles?|other\\s+names?|associated\\s+names?|synonyms|also\\s+known\\s+as)\\s*[:：][ \\t]*",
