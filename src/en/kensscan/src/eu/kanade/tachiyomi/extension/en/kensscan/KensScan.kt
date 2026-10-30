@@ -84,21 +84,21 @@ abstract class KensScan : KeiSource() {
         return "$path?$param"
     }
 
-    private fun hasNextPage(document: Document, page: Int, section: String): Boolean =
-        document.select("a[href]").any { a ->
-            a.attr("abs:href").toHttpUrlOrNull()?.encodedPath?.trimEnd('/') ==
-                "/$section/page/${page + 1}"
-        }
+    private fun hasNextPage(document: Document, page: Int, section: String): Boolean = document.select("a[href]").any { a ->
+        a.attr("abs:href").toHttpUrlOrNull()?.encodedPath?.trimEnd('/') ==
+            "/$section/page/${page + 1}"
+    }
 
     private suspend fun listing(page: Int, order: String = "latest", ranking: Boolean = false): MangasPage {
         val doc = client.get(listingUrl(page, order, ranking)).asJsoup()
         return MangasPage(listingFromDocument(doc), hasNextPage(doc, page, if (ranking) "ranking" else "manga"))
     }
 
-    private class SortFilter : Filter.Select<String>(
-        "Order by",
-        arrayOf("Latest", "A-Z", "Most Bookmarked", "Trending", "Most Views", "New"),
-    ) {
+    private class SortFilter :
+        Filter.Select<String>(
+            "Order by",
+            arrayOf("Latest", "A-Z", "Most Bookmarked", "Trending", "Most Views", "New"),
+        ) {
         val key: String get() = arrayOf("latest", "alphabet", "bookmarks", "trending", "views", "new-manga")[state]
     }
 
@@ -133,14 +133,15 @@ abstract class KensScan : KeiSource() {
         return MangasPage(results.drop(start).take(20), results.size > start + 20)
     }
 
-    private fun matchesQuery(title: String, query: String): Boolean =
-        query.split(Regex("\\s+")).filter { it.isNotBlank() }.all { title.contains(it, ignoreCase = true) }
+    private fun matchesQuery(title: String, query: String): Boolean = query.split(Regex("\\s+")).filter { it.isNotBlank() }.all { title.contains(it, ignoreCase = true) }
 
     private fun hasNextSearchPage(doc: Document, page: Int): Boolean = doc.select("a[href]").any { a ->
         val url = a.attr("abs:href").toHttpUrlOrNull()
         url != null && url.queryParameter("s") != null &&
-            (url.encodedPath.trimEnd('/') == "/page/${page + 1}" ||
-                url.queryParameter("paged") == "${page + 1}")
+            (
+                url.encodedPath.trimEnd('/') == "/page/${page + 1}" ||
+                    url.queryParameter("paged") == "${page + 1}"
+            )
     }
 
     private suspend fun indexedCatalogue(): List<SManga> = catalogueMutex.withLock {
