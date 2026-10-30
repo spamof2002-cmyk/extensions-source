@@ -306,10 +306,10 @@ abstract class KensScan :
         .filter { it.isNotBlank() && !it.equals("N/A", ignoreCase = true) }
         .distinctBy { it.lowercase(Locale.ROOT) }
 
-    // J2K indexes each bullet below a recognised alternative-title heading.
-    // A single comma-delimited line would otherwise be indexed as one alias.
+    // Display names with middle dots; accept comma- and bullet-separated
+    // existing descriptions through splitAlternativeNames when refreshing.
     private fun formatAlternativeNames(names: List<String>): String =
-        "Alternative Names:\n" + names.joinToString("\n") { "- $it" }
+        "Alternative Names: " + names.joinToString(" · ")
 
     private val savedAlternativeHeader = Regex(
         "(?im)^\\s*(?:alternative\\s+(?:titles?|names?)|alt\\s+titles?|other\\s+names?|associated\\s+names?|synonyms|also\\s+known\\s+as)\\s*[:：][ \\t]*",
