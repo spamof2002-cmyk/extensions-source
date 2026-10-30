@@ -141,7 +141,7 @@ abstract class KensScan : KeiSource() {
             (
                 url.encodedPath.trimEnd('/') == "/page/${page + 1}" ||
                     url.queryParameter("paged") == "${page + 1}"
-            )
+                )
     }
 
     private suspend fun indexedCatalogue(): List<SManga> = catalogueMutex.withLock {
