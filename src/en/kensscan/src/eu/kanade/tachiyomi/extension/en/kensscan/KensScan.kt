@@ -99,7 +99,7 @@ abstract class KensScan :
 
     // Match the terminal Page number, not the chapter number in the URL.
     private val numberedPage = Regex(
-        "^(https?://[^?#]+/)(Page)([0-9]+)(\\.(?:webp|png|jpe?g))(\\?[^#]*)?$",
+        "^(https?://[^?#]+/)(Pages?)([0-9]+)(\\.(?:webp|png|jpe?g))(\\?[^#]*)?$",
         RegexOption.IGNORE_CASE,
     )
 
