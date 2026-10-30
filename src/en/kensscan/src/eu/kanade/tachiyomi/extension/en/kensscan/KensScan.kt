@@ -101,8 +101,7 @@ abstract class KensScan : KeiSource() {
         .distinctBy { it.url }
         .toList()
 
-    private fun String.toHttpUrlOrNullPath(): String =
-        this.toHttpUrlOrNull()?.encodedPath.orEmpty()
+    private fun String.toHttpUrlOrNullPath(): String = this.toHttpUrlOrNull()?.encodedPath.orEmpty()
 
     private fun Element.coverUrl(): String? {
         val img = selectFirst("img") ?: return null
@@ -179,8 +178,7 @@ abstract class KensScan : KeiSource() {
         val url: String get() = match.value
     }
 
-    override suspend fun getPageList(chapter: SChapter): List<Page> =
-        pagesFromDocument(client.get(getChapterUrl(chapter)).asJsoup())
+    override suspend fun getPageList(chapter: SChapter): List<Page> = pagesFromDocument(client.get(getChapterUrl(chapter)).asJsoup())
 
     private fun pagesFromDocument(document: Document): List<Page> {
         // Image URLs come from the current chapter HTML, not guessed CDN roots.
@@ -227,8 +225,11 @@ abstract class KensScan : KeiSource() {
                     previewLastPage = maxOf(previewLastPage, page)
                 }
             }
-            if (previewLastPage > 0) previewLastPage + remaining
-            else related.maxOf { it.number } // If the notice precedes all images, fail conservatively.
+            if (previewLastPage > 0) {
+                previewLastPage + remaining
+            } else {
+                related.maxOf { it.number } // If the notice precedes all images, fail conservatively.
+            }
         } else {
             // Free chapters expose their page images in the chapter HTML.
             // Their highest numbered image gives the same count without probes.
