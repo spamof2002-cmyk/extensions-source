@@ -308,8 +308,7 @@ abstract class KensScan :
 
     // Display one bullet per name; keep reading old comma- or dot-separated
     // saved descriptions through splitAlternativeNames when refreshing.
-    private fun formatAlternativeNames(names: List<String>): String =
-        "Alternative Names:\n" + names.joinToString("\n") { "• $it" }
+    private fun formatAlternativeNames(names: List<String>): String = "Alternative Names:\n" + names.joinToString("\n") { "• $it" }
 
     private val savedAlternativeHeader = Regex(
         "(?im)^\\s*(?:alternative\\s+(?:titles?|names?)|alt\\s+titles?|other\\s+names?|associated\\s+names?|synonyms|also\\s+known\\s+as)\\s*[:：][ \\t]*",
@@ -323,9 +322,8 @@ abstract class KensScan :
         return splitAlternativeNames(section)
     }
 
-    private fun shouldSearchAlternativeNames(hasSavedNames: Boolean, isDetailsRefresh: Boolean): Boolean =
-        preferences.getBoolean(PREF_ALT_NAME_SEARCH, true) &&
-            (!hasSavedNames || (isDetailsRefresh && preferences.getBoolean(PREF_RESEARCH_EXISTING_NAMES, false)))
+    private fun shouldSearchAlternativeNames(hasSavedNames: Boolean, isDetailsRefresh: Boolean): Boolean = preferences.getBoolean(PREF_ALT_NAME_SEARCH, true) &&
+        (!hasSavedNames || (isDetailsRefresh && preferences.getBoolean(PREF_RESEARCH_EXISTING_NAMES, false)))
 
     private suspend fun detailWithSearchNames(doc: Document, oldManga: SManga? = null): SManga {
         val manga = detailFromDocument(doc)
