@@ -212,7 +212,7 @@ abstract class KensScan : KeiSource() {
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
         if (url.host != baseUrl.toHttpUrl().host || !seriesPath.matches(url.encodedPath)) return null
-        return detailFromDocument(client.get(url.toString()).asJsoup())
+        return detailWithSearchNames(client.get(url.toString()).asJsoup())
     }
 
     override suspend fun fetchMangaUpdate(
@@ -223,7 +223,9 @@ abstract class KensScan : KeiSource() {
     ): SMangaUpdate {
         // Single request for details and chapters; no duplicate fetch.
         val doc = client.get(getMangaUrl(manga)).asJsoup()
-        val details = if (fetchDetails) detailFromDocument(doc) else manga
+        // Only a details fetch/refetch performs the additional name lookup.
+        // Chapter-only updates keep the existing single request.
+        val details = if (fetchDetails) detailWithSearchNames(doc, manga) else manga
         val resultChapters = if (fetchChapters) chaptersFromDocument(doc) else chapters
         return SMangaUpdate(details, resultChapters)
     }
@@ -232,10 +234,82 @@ abstract class KensScan : KeiSource() {
         "(?i)^(?:(?:alternative|alternate|other|alt)(?:\\s+(?:titles?|names?))?|aliases?|synonyms?)\\s*:?$",
     )
 
+    private val inlineAlternativeNames = Regex(
+        "(?i)^(?:(?:alternative|alternate|other|alt)(?:\\s+(?:titles?|names?))?|aliases?|synonyms?)\\s*[:：]\\s*(.+)$",
+    )
+
+    /** Extract a names field from a search result card, never from a whole results page. */
+    private fun alternativeNamesFromSearchResult(
+        document: Document,
+        mangaPath: String,
+        primaryTitle: String,
+    ): List<String> {
+        val expectedPath = mangaPath.trimEnd('/')
+        for (anchor in document.select("a[href]")) {
+            val path = anchor.attr("abs:href").toHttpUrlOrNull()?.encodedPath?.trimEnd('/')
+            if (path != expectedPath) continue
+
+            // Walk only within this exact result's card. Stop before an ancestor
+            // containing links to multiple series to avoid borrowing another
+            // title's aliases (or labels from a sidebar).
+            var card = anchor.parent()
+            var depth = 0
+            while (card != null && depth++ < 8 && card !is Document) {
+                val seriesUrls = card.select("a[href]").mapNotNull { link ->
+                    link.attr("abs:href").toHttpUrlOrNull()?.encodedPath?.trimEnd('/')
+                        ?.takeIf { seriesPath.matches(it) }
+                }.distinct()
+                if (seriesUrls.any { it != expectedPath }) break
+
+                val aliases = alternativeNamesFromDocument(card)
+                    .filterNot { it.equals(primaryTitle, ignoreCase = true) }
+                if (aliases.isNotEmpty()) return aliases
+                card = card.parent()
+            }
+        }
+        return emptyList()
+    }
+
+    private suspend fun detailWithSearchNames(doc: Document, oldManga: SManga? = null): SManga {
+        val manga = detailFromDocument(doc)
+        if (manga.description.orEmpty().contains("Alternative Names:", ignoreCase = true)) return manga
+
+        // One exact-title search, only at initial details fetch or details
+        // refetch. No catalogue scan and no lookup during chapter-only updates.
+        val names = try {
+            val query = URLEncoder.encode(manga.title, "UTF-8")
+            val searchDoc = client.get("$baseUrl/?s=$query&post_type=wp-manga&m_orderby=latest").asJsoup()
+            val path = getMangaUrl(manga).toHttpUrl().encodedPath
+            alternativeNamesFromSearchResult(searchDoc, path, manga.title)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
+        }
+
+        if (names.isNotEmpty()) {
+            val section = "Alternative Names: ${names.joinToString("; ")}"
+            manga.description = listOfNotNull(manga.description?.takeIf { it.isNotBlank() }, section)
+                .joinToString("\n\n")
+        } else {
+            // A temporary site-search failure must not erase aliases saved by
+            // an earlier successful details refresh.
+            val previous = oldManga?.description.orEmpty().substringAfter("Alternative Names:", "")
+                .trim().takeIf { it.isNotBlank() }
+            if (previous != null) {
+                manga.description = listOfNotNull(
+                    manga.description?.takeIf { it.isNotBlank() },
+                    "Alternative Names: $previous",
+                ).joinToString("\n\n")
+            }
+        }
+        return manga
+    }
+
     // Uses the HTML already fetched for series details; no additional requests.
     // SManga has no dedicated alternative-title field, so expose them in the
     // description, where J2K can display and index them after details refresh.
-    private fun alternativeNamesFromDocument(doc: Document): List<String> {
+    private fun alternativeNamesFromDocument(doc: Element): List<String> {
         val values = mutableListOf<String>()
 
         fun collect(raw: String) {
@@ -257,6 +331,24 @@ abstract class KensScan : KeiSource() {
             }
         }
 
+        // Search result boxes commonly use plain text like
+        // <small>Alternative Names: Foo; Bar</small> rather than a details row.
+        doc.select("span, small, p, div, li, b, strong").forEach { element ->
+            val inline = inlineAlternativeNames.matchEntire(element.ownText().trim())
+            if (inline != null) collect(inline.groupValues[1])
+            if (alternativeLabel.matches(element.ownText().trim())) {
+                element.nextElementSibling()?.let { collect(it.text()) }
+                // Also handle <strong>Alternative Names:</strong> Alias in
+                // a single paragraph, where the alias is a plain text node.
+                val label = element.text().trim()
+                element.parent()?.text()?.trim()?.takeIf {
+                    it.length < 300 && it.startsWith(label, ignoreCase = true)
+                }?.substring(label.length)?.trim()?.trimStart(':', '：', ' ')?.takeIf {
+                    it.isNotBlank()
+                }?.let(::collect)
+            }
+        }
+
         // Other common layouts, including a standalone alternative-title block.
         doc.select(
             ".alternative-titles, .alternative-title, .alternate-titles, .alt-titles, " +
@@ -265,6 +357,10 @@ abstract class KensScan : KeiSource() {
             .forEach { collect(it.text().ifBlank { it.attr("content") }) }
         doc.select("meta[name=alternative-title], meta[name=alternative-titles], meta[name=alternate-title]")
             .forEach { collect(it.attr("content")) }
+        doc.select("[data-alt-titles], [data-alt-names], [data-alternative-names]").forEach { node ->
+            listOf("data-alt-titles", "data-alt-names", "data-alternative-names")
+                .forEach { key -> node.attr(key).takeIf { it.isNotBlank() }?.let(::collect) }
+        }
 
         return values.map { it.trim() }
             .filter { it.isNotBlank() }
