@@ -117,7 +117,16 @@ abstract class KensScan : KeiSource() {
         val url = "$baseUrl/$pagePath?s=$encoded&post_type=wp-manga&m_orderby=$order"
         try {
             val doc = client.get(url).asJsoup()
-            val mangas = listingFromDocument(doc).filter { matchesQuery(it.title, q) }
+            val found = listingFromDocument(doc)
+            val exactMatches = found.filter { matchesQuery(it.title, q) }
+            // The website can match alternative titles that are not visible as
+            // the card's main title. Trust the site's results on a search page.
+            // Otherwise, use only primary-title matches to avoid false hits
+            // from sidebars on a redirected / non-search page.
+            val searchPage = doc.select("h1, title").any {
+                it.text().contains("search", ignoreCase = true)
+            } || doc.selectFirst(".search-results, .search-page, .search-result-list") != null
+            val mangas = if (searchPage) found else exactMatches
             if (mangas.isNotEmpty()) {
                 return MangasPage(mangas, hasNextSearchPage(doc, page))
             }
@@ -219,6 +228,49 @@ abstract class KensScan : KeiSource() {
         return SMangaUpdate(details, resultChapters)
     }
 
+    private val alternativeLabel = Regex(
+        "(?i)^(?:(?:alternative|alternate|other|alt)(?:\\s+(?:titles?|names?))?|aliases?|synonyms?)\\s*:?$",
+    )
+
+    // Uses the HTML already fetched for series details; no additional requests.
+    // SManga has no dedicated alternative-title field, so expose them in the
+    // description, where J2K can display and index them after details refresh.
+    private fun alternativeNamesFromDocument(doc: Document): List<String> {
+        val values = mutableListOf<String>()
+
+        fun collect(raw: String) {
+            val cleaned = raw.trim().replace(
+                Regex("(?i)^(?:alternative|alternate|other|alt)\\s+(?:names?|titles?)\\s*:\\s*"),
+                "",
+            )
+            cleaned.split(Regex("[;|\\n]+")).map { it.trim().trim(',', '•', '-') }
+                .filter { it.isNotBlank() && it != "-" && it != "N/A" }
+                .forEach(values::add)
+        }
+
+        // Madara/WordPress details, including heading/value pairs.
+        doc.select(".post-content_item, .series-info-item, .manga-info-item, .info-item, tr, dl > div").forEach { row ->
+            val heading = row.selectFirst(".summary-heading, .info-label, .label, dt, th, h4, h5, h6")
+            if (heading != null && alternativeLabel.matches(heading.text().trim())) {
+                val value = row.selectFirst(".summary-content, .info-value, .value, dd, td")
+                if (value != null) collect(value.text())
+            }
+        }
+
+        // Other common layouts, including a standalone alternative-title block.
+        doc.select(
+            ".alternative-titles, .alternative-title, .alternate-titles, .alt-titles, " +
+                ".other-titles, .other-names, [itemprop=alternateName]",
+        )
+            .forEach { collect(it.text().ifBlank { it.attr("content") }) }
+        doc.select("meta[name=alternative-title], meta[name=alternative-titles], meta[name=alternate-title]")
+            .forEach { collect(it.attr("content")) }
+
+        return values.map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinctBy { it.lowercase(Locale.ROOT) }
+    }
+
     private fun detailFromDocument(doc: Document): SManga = SManga.create().apply {
         setUrlWithoutDomain(doc.location())
         title = doc.selectFirst("h1")?.text()?.trim().orEmpty()
@@ -227,9 +279,19 @@ abstract class KensScan : KeiSource() {
             ?: doc.selectFirst("main img, article img")?.absUrl("src")
         genre = doc.select("a[href*='/manga-genre/']")
             .map { it.text().trim() }.filter { it.isNotBlank() }.distinct().joinToString(", ")
-        description = doc.select("main p, article p, .description p, .summary p")
+        val synopsis = doc.select("main p, article p, .description p, .summary p")
             .map { it.text().trim() }.firstOrNull { it.length >= 80 }
             ?: doc.selectFirst("meta[name=description]")?.attr("content")
+        val alternateNames = alternativeNamesFromDocument(doc)
+            .filterNot { it.equals(title, ignoreCase = true) }
+        description = if (alternateNames.isEmpty()) {
+            synopsis
+        } else {
+            listOfNotNull(
+                synopsis?.takeIf { it.isNotBlank() },
+                "Alternative Names: ${alternateNames.joinToString("; ")}",
+            ).joinToString("\n\n")
+        }
         val text = doc.text()
         status = when {
             Regex("(?i)\\bcompleted\\b").containsMatchIn(text) -> SManga.COMPLETED
