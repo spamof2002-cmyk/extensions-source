@@ -63,11 +63,19 @@ abstract class KensScan :
             summary = "Search again even if names are saved. Requires Alternative-name search to be on."
             setDefaultValue(false)
         }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_CHAPTER_ALT_NAME_SEARCH
+            title = "Search missing alternative names during chapter updates"
+            summary = "When chapter updates have no saved names, allow one extra search. Requires Alternative-name search."
+            setDefaultValue(false)
+        }.also(screen::addPreference)
     }
 
     companion object {
         private const val PREF_ALT_NAME_SEARCH = "kensscan_alt_names_first_fetch"
         private const val PREF_RESEARCH_EXISTING_NAMES = "kensscan_alt_names_retry_details"
+        private const val PREF_CHAPTER_ALT_NAME_SEARCH = "kensscan_alt_names_chapter_updates"
     }
 
     private val seriesPath = Regex("^/manga/[^/]+/?$", RegexOption.IGNORE_CASE)
@@ -251,9 +259,13 @@ abstract class KensScan :
     ): SMangaUpdate {
         // Single request for details and chapters; no duplicate fetch.
         val doc = client.get(getMangaUrl(manga)).asJsoup()
-        // Only a details fetch/refetch can perform an alternative-title search.
-        // Chapter-only updates keep the existing single request.
-        val details = if (fetchDetails) detailWithSearchNames(doc, manga) else manga
+        // A new/uninitialised series needs its first details fetch even if J2K
+        // initially requests chapters. Normal chapter-only updates stay light.
+        val details = when {
+            fetchDetails || !manga.initialized -> detailWithSearchNames(doc, manga)
+            fetchChapters && shouldSearchDuringChapterUpdate(manga) -> addMissingNamesDuringChapterUpdate(manga, doc)
+            else -> manga
+        }
         val resultChapters = if (fetchChapters) chaptersFromDocument(doc) else chapters
         return SMangaUpdate(details, resultChapters)
     }
@@ -322,6 +334,39 @@ abstract class KensScan :
         return splitAlternativeNames(section)
     }
 
+    // The chapter-only option never runs when the master switch is off or
+    // any alternative names already exist in the saved description.
+    private fun shouldSearchDuringChapterUpdate(manga: SManga): Boolean = preferences.getBoolean(PREF_ALT_NAME_SEARCH, true) &&
+        preferences.getBoolean(PREF_CHAPTER_ALT_NAME_SEARCH, false) && savedAlternativeNames(manga.description).isEmpty()
+
+    // Only amend the description on chapter-only updates; do not overwrite
+    // other manga metadata or replace the synopsis if the lookup fails.
+    private suspend fun addMissingNamesDuringChapterUpdate(manga: SManga, doc: Document): SManga {
+        val pageNames = alternativeNamesFromDocument(doc)
+        val searched = if (pageNames.isEmpty()) searchAlternativeNames(manga) else emptyList()
+        val names = (pageNames + searched).flatMap(::splitAlternativeNames)
+            .filterNot { it.equals(manga.title, ignoreCase = true) }
+            .distinctBy { it.lowercase(Locale.ROOT) }
+        if (names.isNotEmpty()) {
+            manga.description = listOfNotNull(
+                manga.description?.takeIf { it.isNotBlank() },
+                formatAlternativeNames(names),
+            ).joinToString("\n\n")
+        }
+        return manga
+    }
+
+    private suspend fun searchAlternativeNames(manga: SManga): List<String> = try {
+        val query = URLEncoder.encode(manga.title, "UTF-8")
+        val searchDoc = client.get("$baseUrl/?s=$query&post_type=wp-manga&m_orderby=latest").asJsoup()
+        val path = getMangaUrl(manga).toHttpUrl().encodedPath
+        alternativeNamesFromSearchResult(searchDoc, path, manga.title)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        emptyList()
+    }
+
     private fun shouldSearchAlternativeNames(hasSavedNames: Boolean, isDetailsRefresh: Boolean): Boolean = preferences.getBoolean(PREF_ALT_NAME_SEARCH, true) &&
         (!hasSavedNames || (isDetailsRefresh && preferences.getBoolean(PREF_RESEARCH_EXISTING_NAMES, false)))
 
@@ -333,23 +378,10 @@ abstract class KensScan :
             .filterNot { it.equals(manga.title, ignoreCase = true) }
             .distinctBy { it.lowercase(Locale.ROOT) }
 
-        val shouldSearch = shouldSearchAlternativeNames(allKnown.isNotEmpty(), oldManga != null)
-        // If both switches are off, preserve saved titles without doing any
-        // search. No network request is made for chapter-only updates either.
-        val searched = if (shouldSearch) {
-            try {
-                val query = URLEncoder.encode(manga.title, "UTF-8")
-                val searchDoc = client.get("$baseUrl/?s=$query&post_type=wp-manga&m_orderby=latest").asJsoup()
-                val path = getMangaUrl(manga).toHttpUrl().encodedPath
-                alternativeNamesFromSearchResult(searchDoc, path, manga.title)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                emptyList()
-            }
-        } else {
-            emptyList()
-        }
+        val shouldSearch = shouldSearchAlternativeNames(allKnown.isNotEmpty(), oldManga?.initialized == true)
+        // Existing names are retained, whether the master search switch is on
+        // or off. A failed search must not erase them.
+        val searched = if (shouldSearch) searchAlternativeNames(manga) else emptyList()
 
         val finalNames = (allKnown + searched.flatMap(::splitAlternativeNames))
             .filterNot { it.equals(manga.title, ignoreCase = true) }
