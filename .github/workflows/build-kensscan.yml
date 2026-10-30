@@ -2,11 +2,6 @@ name: Build Kens Scan APK
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'src/en/kensscan/**'
-      - '.github/workflows/build-kensscan.yml'
 
 permissions:
   contents: read
