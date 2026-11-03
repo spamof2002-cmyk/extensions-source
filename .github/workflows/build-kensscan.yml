@@ -2,9 +2,12 @@ name: Build Kens Scan APK
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - kens-scans-main-full-filters-v1.6.12
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -22,6 +25,19 @@ jobs:
 
       - name: Configure Gradle
         uses: gradle/actions/setup-gradle@v4
+
+      - name: Format Kens Scan Kotlin
+        run: ./gradlew :src:en:kensscan:spotlessApply
+
+      - name: Commit formatting changes
+        run: |
+          if ! git diff --quiet -- src/en/kensscan; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/en/kensscan
+            git commit -m "style: format Kens Scans Kotlin source"
+            git push
+          fi
 
       - name: Build Kens Scan debug APK
         run: ./gradlew :src:en:kensscan:assembleDebug --stacktrace
