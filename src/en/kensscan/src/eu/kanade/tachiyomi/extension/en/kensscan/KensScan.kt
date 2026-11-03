@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.extension.en.kensscan
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.source.ConfigurableSource
+import eu.kanade.tachiyomi.multisrc.madara.GenreRoute
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -15,7 +16,10 @@ import keiyoushi.network.get
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonElement
 import kotlinx.coroutines.CancellationException
+import kotlinx.serialization.json.JsonElement
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -130,49 +134,109 @@ abstract class KensScan :
         return MangasPage(listingFromDocument(doc), hasNextPage(doc, page, if (ranking) "ranking" else "manga"))
     }
 
-    private class SortFilter :
-        Filter.Select<String>(
-            "Order by",
-            arrayOf("Latest", "A-Z", "Most Bookmarked", "Trending", "Most Views", "New"),
-        ) {
-        val key: String get() = arrayOf("latest", "alphabet", "bookmarks", "trending", "views", "new-manga")[state]
+    // Browse filters follow Kensscan's actual search query parameters. The
+    // existing catalogue listing path is retained when none are selected.
+    private class SortFilter : Filter.Select<String>(
+        "Order by",
+        arrayOf("Latest", "A-Z", "Most Bookmarked", "Trending", "Most Views", "New", "Rating", "Relevance"),
+    ) {
+        val key: String get() = arrayOf("latest", "alphabet", "bookmarks", "trending", "views", "new-manga", "rating", "")[state]
     }
 
-    override fun getFilterList(data: kotlinx.serialization.json.JsonElement?): FilterList = FilterList(SortFilter())
+    private class TextSearchFilter(name: String, val param: String) : Filter.Text(name)
+    private class StatusCheckBox(name: String, val paramValue: String) : Filter.CheckBox(name)
+    private class StatusList : Filter.Group<StatusCheckBox>(
+        "Status",
+        listOf(
+            StatusCheckBox("Completed", "end"),
+            StatusCheckBox("Ongoing", "on-going"),
+            StatusCheckBox("Canceled", "canceled"),
+            StatusCheckBox("On hold", "on-hold"),
+        ),
+    )
+
+    private class GenreConditionFilter : Filter.Select<String>("Genres match", arrayOf("Any (OR)", "All (AND)")) {
+        val paramValue: String get() = if (state == 1) "1" else ""
+    }
+
+    private class GenreCheckBox(name: String, val slug: String) : Filter.CheckBox(name)
+    private class GenreList(genres: List<GenreRoute>) : Filter.Group<GenreCheckBox>(
+        "Genres", genres.map { GenreCheckBox(it.name, it.slug) },
+    )
+
+    // Populating the genre filter costs one request when the filter data is
+    // requested, not one request per chapter read, update or Browse operation.
+    override suspend fun fetchFilterData(): JsonElement = client.get("$baseUrl/?s=&post_type=wp-manga").asJsoup()
+        .select("div.checkbox-group input[name='genre[]']")
+        .mapNotNull { input ->
+            val slug = input.attr("value").trim()
+            val label = input.nextElementSibling()?.text()?.trim().orEmpty()
+            if (slug.isBlank() || label.isBlank()) null
+            else GenreRoute(label, slug, "/manga-genre/$slug/")
+        }.toJsonElement()
+
+    override fun getFilterList(data: JsonElement?): FilterList {
+        val genres = runCatching { data?.parseAs<List<GenreRoute>>() }.getOrNull().orEmpty()
+        return FilterList(
+            buildList {
+                add(TextSearchFilter("Artist", "artist"))
+                add(TextSearchFilter("Release year", "release"))
+                add(StatusList())
+                add(SortFilter())
+                if (genres.isNotEmpty()) {
+                    add(GenreConditionFilter())
+                    add(GenreList(genres))
+                }
+            },
+        )
+    }
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         val order = filters.filterIsInstance<SortFilter>().firstOrNull()?.key ?: "latest"
-        if (query.isBlank()) return listing(page, order)
+        val artist = filters.filterIsInstance<TextSearchFilter>().firstOrNull { it.param == "artist" }?.state?.trim().orEmpty()
+        val year = filters.filterIsInstance<TextSearchFilter>().firstOrNull { it.param == "release" }?.state?.trim().orEmpty()
+        val statuses = filters.filterIsInstance<StatusList>().flatMap { it.state }.filter { it.state }
+        val genres = filters.filterIsInstance<GenreList>().flatMap { it.state }.filter { it.state }
+        val allGenres = filters.filterIsInstance<GenreConditionFilter>().any { it.paramValue == "1" }
+        val hasAdvancedFilters = artist.isNotBlank() || year.isNotBlank() || statuses.isNotEmpty() || genres.isNotEmpty()
 
-        val q = query.trim()
-        val encoded = URLEncoder.encode(q, "UTF-8")
-        // Madara / WP Manga search, including post_type so WordPress searches
-        // manga records instead of blog posts. A fallback covers sites where
-        // the search widget uses AJAX and ignores ordinary search URLs.
-        val pagePath = if (page <= 1) "" else "page/$page/"
-        val url = "$baseUrl/$pagePath?s=$encoded&post_type=wp-manga&m_orderby=$order"
+        // Preserve the custom source's existing no-filter catalogue Browse and
+        // sorting, including Popular ranking and zero additional network work.
+        if (query.isBlank() && !hasAdvancedFilters) return listing(page, order.ifBlank { "latest" })
+
+        // Use the official site's search endpoint when advanced filters are in
+        // use. Never run the unfiltered catalogue fallback for filtered results.
+        val pagePath = if (page <= 1) "/" else "/page/$page/"
+        val builder = baseUrl.toHttpUrl().newBuilder()
+            .encodedPath(pagePath)
+            .addQueryParameter("s", query.trim())
+            .addQueryParameter("post_type", "wp-manga")
+        if (order.isNotBlank()) builder.addQueryParameter("m_orderby", order)
+        if (artist.isNotBlank()) builder.addQueryParameter("artist", artist)
+        if (year.isNotBlank()) builder.addQueryParameter("release", year)
+        statuses.forEach { builder.addQueryParameter("status[]", it.paramValue) }
+        genres.forEach { builder.addQueryParameter("genre[]", it.slug) }
+        if (genres.isNotEmpty() && allGenres) builder.addQueryParameter("op", "1")
+        val url = builder.build().toString()
+
         try {
             val doc = client.get(url).asJsoup()
             val found = listingFromDocument(doc)
-            val exactMatches = found.filter { matchesQuery(it.title, q) }
-            // The website can match alternative titles that are not visible as
-            // the card's main title. Trust the site's results on a search page.
-            // Otherwise, use only primary-title matches to avoid false hits
-            // from sidebars on a redirected / non-search page.
-            val searchPage = doc.select("h1, title").any {
-                it.text().contains("search", ignoreCase = true)
-            } || doc.selectFirst(".search-results, .search-page, .search-result-list") != null
-            val mangas = if (searchPage) found else exactMatches
-            if (mangas.isNotEmpty()) {
-                return MangasPage(mangas, hasNextSearchPage(doc, page))
+            val q = query.trim()
+            val searchPage = doc.select("h1, title").any { it.text().contains("search", ignoreCase = true) } ||
+                doc.selectFirst(".search-results, .search-page, .search-result-list") != null
+            val matches = if (hasAdvancedFilters || searchPage) found else found.filter { matchesQuery(it.title, q) }
+            if (hasAdvancedFilters || matches.isNotEmpty()) {
+                return MangasPage(matches, hasNextSearchPage(doc, page))
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
-            // Fall back to the catalogue index below.
+        } catch (e: Exception) {
+            if (hasAdvancedFilters) throw e
+            // Only the old unfiltered explicit-title search uses the fallback.
         }
-        // The fallback is performed only for a user-initiated search, not for
-        // automatic updates. A cached catalogue avoids repeat page requests.
+
+        val q = query.trim()
         val results = indexedCatalogue().filter { matchesQuery(it.title, q) }
         val start = (page - 1) * 20
         return MangasPage(results.drop(start).take(20), results.size > start + 20)
@@ -232,6 +296,19 @@ abstract class KensScan :
                 this.title = title
                 thumbnail_url = anchor.coverUrl()
                     ?: anchor.parent()?.coverUrl()
+                // Search-card details come from HTML we already downloaded.
+                val card = anchor.closest(".manga-item, .c-tabs-item__content")
+                if (card != null) {
+                    author = card.select(".mg_author .summary-content a").eachText()
+                        .joinToString(", ").ifBlank { null }
+                    artist = card.select(".mg_artists .summary-content a").eachText()
+                        .joinToString(", ").ifBlank { null }
+                    genre = card.select(".mg_genres a, .manga-genre-list a").eachText()
+                        .joinToString(", ").ifBlank { null }
+                    card.selectFirst(".mg_status .summary-content")?.text()?.let { value ->
+                        parseExplicitStatus(value)?.let { status = it }
+                    }
+                }
             }
         }
         .distinctBy { it.url }
@@ -247,8 +324,17 @@ abstract class KensScan :
     }
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        if (url.host != baseUrl.toHttpUrl().host || !seriesPath.matches(url.encodedPath)) return null
-        return detailWithSearchNames(client.get(url.toString()).asJsoup())
+        if (url.host != baseUrl.toHttpUrl().host) return null
+        // A shared chapter link resolves to its series without a chapter request.
+        val seriesUrl = when {
+            seriesPath.matches(url.encodedPath) -> url
+            chapterPath.matches(url.encodedPath) -> {
+                val parts = url.encodedPath.trim('/').split('/')
+                url.newBuilder().encodedPath("/manga/${parts[1]}/").query(null).build()
+            }
+            else -> return null
+        }
+        return detailWithSearchNames(client.get(seriesUrl.toString()).asJsoup())
     }
 
     override suspend fun fetchMangaUpdate(
@@ -278,22 +364,26 @@ abstract class KensScan :
         "(?i)^(?:(?:alternative|alternate|other|alt)(?:\\s+(?:titles?|names?))?|aliases?|synonyms?)\\s*[:：]\\s*(.+)$",
     )
 
-    /** Extract a names field from a search result card, never from a whole results page. */
-    private fun alternativeNamesFromSearchResult(
-        document: Document,
-        mangaPath: String,
-        primaryTitle: String,
-    ): List<String> {
+    /** Metadata from one matching search card; no other series' information is considered. */
+    private data class SearchCardInfo(
+        val names: List<String>,
+        val author: String?,
+        val artist: String?,
+        val genre: String?,
+        val status: Int?,
+    )
+
+    private fun searchCardInfo(document: Document, mangaPath: String, primaryTitle: String): SearchCardInfo? {
         val expectedPath = mangaPath.trimEnd('/')
         for (anchor in document.select("a[href]")) {
             val path = anchor.attr("abs:href").toHttpUrlOrNull()?.encodedPath?.trimEnd('/')
             if (path != expectedPath) continue
 
-            // Walk only within this exact result's card. Stop before an ancestor
-            // containing links to multiple series to avoid borrowing another
-            // title's aliases (or labels from a sidebar).
+            // Never climb into the search-results container or a sidebar that
+            // includes other titles. Instead use the nearest complete card.
             var card = anchor.parent()
             var depth = 0
+            var candidate: SearchCardInfo? = null
             while (card != null && depth++ < 8 && card !is Document) {
                 val seriesUrls = card.select("a[href]").mapNotNull { link ->
                     link.attr("abs:href").toHttpUrlOrNull()?.encodedPath?.trimEnd('/')
@@ -301,13 +391,49 @@ abstract class KensScan :
                 }.distinct()
                 if (seriesUrls.any { it != expectedPath }) break
 
-                val aliases = alternativeNamesFromDocument(card)
-                    .filterNot { it.equals(primaryTitle, ignoreCase = true) }
-                if (aliases.isNotEmpty()) return aliases
+                val names = (
+                    alternativeNamesFromDocument(card) +
+                        card.selectFirst(".mg_alternative .summary-content")?.text().orEmpty().let(::splitAlternativeNames)
+                    ).filterNot { it.equals(primaryTitle, ignoreCase = true) }
+                    .distinctBy { it.lowercase(Locale.ROOT) }
+                val author = card.select(".mg_author .summary-content a").eachText()
+                    .map { it.trim() }.filter { it.isNotBlank() }.distinct().joinToString(", ").ifBlank { null }
+                val artist = card.select(".mg_artists .summary-content a").eachText()
+                    .map { it.trim() }.filter { it.isNotBlank() }.distinct().joinToString(", ").ifBlank { null }
+                val genres = card.select(".mg_genres a, .manga-genre-list a").eachText()
+                    .map { it.trim() }.filter { it.isNotBlank() }.distinct().joinToString(", ").ifBlank { null }
+                val status = parseExplicitStatus(card.selectFirst(".mg_status .summary-content")?.text())
+
+                if (names.isNotEmpty() || author != null || artist != null || genres != null || status != null) {
+                    candidate = SearchCardInfo(
+                        names = names.ifEmpty { candidate?.names.orEmpty() },
+                        author = author ?: candidate?.author,
+                        artist = artist ?: candidate?.artist,
+                        genre = genres ?: candidate?.genre,
+                        status = status ?: candidate?.status,
+                    )
+                }
+                if (card.hasClass("c-tabs-item__content") || card.hasClass("manga-item")) break
                 card = card.parent()
             }
+            if (candidate != null) return candidate
         }
-        return emptyList()
+        return null
+    }
+
+    private fun parseExplicitStatus(value: String?): Int? = when {
+        value.isNullOrBlank() -> null
+        Regex("(?i)\\b(completed|complete|finished)\\b").containsMatchIn(value) -> SManga.COMPLETED
+        Regex("(?i)\\b(ongoing|on-going|updating)\\b").containsMatchIn(value) -> SManga.ONGOING
+        else -> null
+    }
+
+    private fun applySearchCardInfo(manga: SManga, info: SearchCardInfo?) {
+        if (info == null) return
+        info.author?.let { manga.author = it }
+        info.artist?.let { manga.artist = it }
+        info.genre?.let { manga.genre = it }
+        info.status?.let { manga.status = it }
     }
 
     // The site's search cards display comma-separated names. Legacy saved
@@ -360,7 +486,19 @@ abstract class KensScan :
         val query = URLEncoder.encode(manga.title, "UTF-8")
         val searchDoc = client.get("$baseUrl/?s=$query&post_type=wp-manga&m_orderby=latest").asJsoup()
         val path = getMangaUrl(manga).toHttpUrl().encodedPath
-        alternativeNamesFromSearchResult(searchDoc, path, manga.title)
+        val card = searchCardInfo(searchDoc, path, manga.title) ?: run {
+            // Official site search strips punctuation and limits very long
+            // titles to nine words. This second request is fallback-only.
+            val shortTitle = manga.title.split(Regex("[^\\p{L}\\p{N}]+"))
+                .filter { it.isNotBlank() }.take(9).joinToString(" ")
+            if (shortTitle.isBlank() || shortTitle.equals(manga.title, ignoreCase = true)) null
+            else {
+                val fallback = URLEncoder.encode(shortTitle, "UTF-8")
+                searchCardInfo(client.get("$baseUrl/?s=$fallback&post_type=wp-manga").asJsoup(), path, manga.title)
+            }
+        }
+        applySearchCardInfo(manga, card)
+        card?.names.orEmpty()
     } catch (e: CancellationException) {
         throw e
     } catch (_: Exception) {
@@ -372,6 +510,11 @@ abstract class KensScan :
 
     private suspend fun detailWithSearchNames(doc: Document, oldManga: SManga? = null): SManga {
         val manga = detailFromDocument(doc)
+        // Don't erase previously fetched metadata when no extra search runs.
+        manga.author = oldManga?.author
+        manga.artist = oldManga?.artist
+        if (manga.genre.isNullOrBlank()) manga.genre = oldManga?.genre
+        if (manga.status == SManga.UNKNOWN) oldManga?.status?.let { manga.status = it }
         val savedNames = savedAlternativeNames(oldManga?.description)
         val pageNames = savedAlternativeNames(manga.description)
         val allKnown = (pageNames + savedNames)
@@ -480,12 +623,14 @@ abstract class KensScan :
                 formatAlternativeNames(alternateNames),
             ).joinToString("\n\n")
         }
-        val text = doc.text()
-        status = when {
-            Regex("(?i)\\bcompleted\\b").containsMatchIn(text) -> SManga.COMPLETED
-            Regex("(?i)\\bongoing\\b").containsMatchIn(text) -> SManga.ONGOING
-            else -> SManga.UNKNOWN
-        }
+        // Only read this series' status; related titles on the same page may
+        // contain words such as "Completed" or "Ongoing".
+        val statusText = doc.selectFirst(".mg_status .summary-content")?.text()
+            ?: doc.select(".post-content_item").firstNotNullOfOrNull { row ->
+                val heading = row.selectFirst(".summary-heading")?.text()?.trim()
+                if (heading.equals("Status", ignoreCase = true)) row.selectFirst(".summary-content")?.text() else null
+            }
+        status = parseExplicitStatus(statusText) ?: SManga.UNKNOWN
     }
 
     private fun parseChapterDate(a: Element): Long {
