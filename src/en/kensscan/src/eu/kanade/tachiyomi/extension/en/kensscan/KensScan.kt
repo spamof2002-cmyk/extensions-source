@@ -2,7 +2,6 @@ package eu.kanade.tachiyomi.extension.en.kensscan
 
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.multisrc.madara.GenreRoute
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -162,10 +161,10 @@ abstract class KensScan :
     }
 
     private class GenreCheckBox(name: String, val slug: String) : Filter.CheckBox(name)
-    private class GenreList(genres: List<GenreRoute>) :
+    private class GenreList(genres: List<Pair<String, String>>) :
         Filter.Group<GenreCheckBox>(
             "Genres",
-            genres.map { GenreCheckBox(it.name, it.slug) },
+            genres.map { GenreCheckBox(it.first, it.second) },
         )
 
     // Populating the genre filter costs one request when the filter data is
@@ -178,12 +177,13 @@ abstract class KensScan :
             if (slug.isBlank() || label.isBlank()) {
                 null
             } else {
-                GenreRoute(label, slug, "/manga-genre/$slug/")
+                listOf(label, slug)
             }
         }.toJsonElement()
 
     override fun getFilterList(data: JsonElement?): FilterList {
-        val genres = runCatching { data?.parseAs<List<GenreRoute>>() }.getOrNull().orEmpty()
+        val genres = runCatching { data?.parseAs<List<List<String>>>() }.getOrNull().orEmpty()
+            .mapNotNull { values -> if (values.size == 2) values[0] to values[1] else null }
         return FilterList(
             buildList {
                 add(TextSearchFilter("Artist", "artist"))
