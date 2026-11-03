@@ -2,8 +2,8 @@ package eu.kanade.tachiyomi.extension.en.kensscan
 
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.multisrc.madara.GenreRoute
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -19,12 +19,12 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonElement
 import kotlinx.coroutines.CancellationException
-import kotlinx.serialization.json.JsonElement
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -136,33 +136,37 @@ abstract class KensScan :
 
     // Browse filters follow Kensscan's actual search query parameters. The
     // existing catalogue listing path is retained when none are selected.
-    private class SortFilter : Filter.Select<String>(
-        "Order by",
-        arrayOf("Latest", "A-Z", "Most Bookmarked", "Trending", "Most Views", "New", "Rating", "Relevance"),
-    ) {
+    private class SortFilter :
+        Filter.Select<String>(
+            "Order by",
+            arrayOf("Latest", "A-Z", "Most Bookmarked", "Trending", "Most Views", "New", "Rating", "Relevance"),
+        ) {
         val key: String get() = arrayOf("latest", "alphabet", "bookmarks", "trending", "views", "new-manga", "rating", "")[state]
     }
 
     private class TextSearchFilter(name: String, val param: String) : Filter.Text(name)
     private class StatusCheckBox(name: String, val paramValue: String) : Filter.CheckBox(name)
-    private class StatusList : Filter.Group<StatusCheckBox>(
-        "Status",
-        listOf(
-            StatusCheckBox("Completed", "end"),
-            StatusCheckBox("Ongoing", "on-going"),
-            StatusCheckBox("Canceled", "canceled"),
-            StatusCheckBox("On hold", "on-hold"),
-        ),
-    )
+    private class StatusList :
+        Filter.Group<StatusCheckBox>(
+            "Status",
+            listOf(
+                StatusCheckBox("Completed", "end"),
+                StatusCheckBox("Ongoing", "on-going"),
+                StatusCheckBox("Canceled", "canceled"),
+                StatusCheckBox("On hold", "on-hold"),
+            ),
+        )
 
     private class GenreConditionFilter : Filter.Select<String>("Genres match", arrayOf("Any (OR)", "All (AND)")) {
         val paramValue: String get() = if (state == 1) "1" else ""
     }
 
     private class GenreCheckBox(name: String, val slug: String) : Filter.CheckBox(name)
-    private class GenreList(genres: List<GenreRoute>) : Filter.Group<GenreCheckBox>(
-        "Genres", genres.map { GenreCheckBox(it.name, it.slug) },
-    )
+    private class GenreList(genres: List<GenreRoute>) :
+        Filter.Group<GenreCheckBox>(
+            "Genres",
+            genres.map { GenreCheckBox(it.name, it.slug) },
+        )
 
     // Populating the genre filter costs one request when the filter data is
     // requested, not one request per chapter read, update or Browse operation.
@@ -171,8 +175,11 @@ abstract class KensScan :
         .mapNotNull { input ->
             val slug = input.attr("value").trim()
             val label = input.nextElementSibling()?.text()?.trim().orEmpty()
-            if (slug.isBlank() || label.isBlank()) null
-            else GenreRoute(label, slug, "/manga-genre/$slug/")
+            if (slug.isBlank() || label.isBlank()) {
+                null
+            } else {
+                GenreRoute(label, slug, "/manga-genre/$slug/")
+            }
         }.toJsonElement()
 
     override fun getFilterList(data: JsonElement?): FilterList {
@@ -491,8 +498,9 @@ abstract class KensScan :
             // titles to nine words. This second request is fallback-only.
             val shortTitle = manga.title.split(Regex("[^\\p{L}\\p{N}]+"))
                 .filter { it.isNotBlank() }.take(9).joinToString(" ")
-            if (shortTitle.isBlank() || shortTitle.equals(manga.title, ignoreCase = true)) null
-            else {
+            if (shortTitle.isBlank() || shortTitle.equals(manga.title, ignoreCase = true)) {
+                null
+            } else {
                 val fallback = URLEncoder.encode(shortTitle, "UTF-8")
                 searchCardInfo(client.get("$baseUrl/?s=$fallback&post_type=wp-manga").asJsoup(), path, manga.title)
             }
