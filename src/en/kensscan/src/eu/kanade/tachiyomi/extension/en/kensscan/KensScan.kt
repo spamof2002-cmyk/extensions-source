@@ -133,9 +133,9 @@ abstract class KensScan :
     private class SortFilter :
         Filter.Select<String>(
             "Order by",
-            arrayOf("Latest", "A-Z", "Most Bookmarked", "Trending", "Most Views", "New"),
+            arrayOf("Latest", "A-Z", "Most Bookmarked", "Trending", "Most Views", "New", "Rating"),
         ) {
-        val key: String get() = arrayOf("latest", "alphabet", "bookmarks", "trending", "views", "new-manga")[state]
+        val key: String get() = arrayOf("latest", "alphabet", "bookmarks", "trending", "views", "new-manga", "rating")[state]
     }
 
     override fun getFilterList(data: kotlinx.serialization.json.JsonElement?): FilterList = FilterList(SortFilter())
@@ -247,8 +247,17 @@ abstract class KensScan :
     }
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        if (url.host != baseUrl.toHttpUrl().host || !seriesPath.matches(url.encodedPath)) return null
-        return detailWithSearchNames(client.get(url.toString()).asJsoup())
+        if (url.host != baseUrl.toHttpUrl().host) return null
+        // A shared chapter link resolves to its series without a chapter request.
+        val seriesUrl = when {
+            seriesPath.matches(url.encodedPath) -> url
+            chapterPath.matches(url.encodedPath) -> {
+                val parts = url.encodedPath.trim('/').split('/')
+                url.newBuilder().encodedPath("/manga/${parts[1]}/").query(null).build()
+            }
+            else -> return null
+        }
+        return detailWithSearchNames(client.get(seriesUrl.toString()).asJsoup())
     }
 
     override suspend fun fetchMangaUpdate(
@@ -278,22 +287,26 @@ abstract class KensScan :
         "(?i)^(?:(?:alternative|alternate|other|alt)(?:\\s+(?:titles?|names?))?|aliases?|synonyms?)\\s*[:：]\\s*(.+)$",
     )
 
-    /** Extract a names field from a search result card, never from a whole results page. */
-    private fun alternativeNamesFromSearchResult(
-        document: Document,
-        mangaPath: String,
-        primaryTitle: String,
-    ): List<String> {
+    /** Metadata from one matching search card; no other series' information is considered. */
+    private data class SearchCardInfo(
+        val names: List<String>,
+        val author: String?,
+        val artist: String?,
+        val genre: String?,
+        val status: Int?,
+    )
+
+    private fun searchCardInfo(document: Document, mangaPath: String, primaryTitle: String): SearchCardInfo? {
         val expectedPath = mangaPath.trimEnd('/')
         for (anchor in document.select("a[href]")) {
             val path = anchor.attr("abs:href").toHttpUrlOrNull()?.encodedPath?.trimEnd('/')
             if (path != expectedPath) continue
 
-            // Walk only within this exact result's card. Stop before an ancestor
-            // containing links to multiple series to avoid borrowing another
-            // title's aliases (or labels from a sidebar).
+            // Never climb into the search-results container or a sidebar that
+            // includes other titles. Instead use the nearest complete card.
             var card = anchor.parent()
             var depth = 0
+            var candidate: SearchCardInfo? = null
             while (card != null && depth++ < 8 && card !is Document) {
                 val seriesUrls = card.select("a[href]").mapNotNull { link ->
                     link.attr("abs:href").toHttpUrlOrNull()?.encodedPath?.trimEnd('/')
@@ -301,13 +314,49 @@ abstract class KensScan :
                 }.distinct()
                 if (seriesUrls.any { it != expectedPath }) break
 
-                val aliases = alternativeNamesFromDocument(card)
-                    .filterNot { it.equals(primaryTitle, ignoreCase = true) }
-                if (aliases.isNotEmpty()) return aliases
+                val names = (
+                    alternativeNamesFromDocument(card) +
+                        card.selectFirst(".mg_alternative .summary-content")?.text().orEmpty().let(::splitAlternativeNames)
+                    ).filterNot { it.equals(primaryTitle, ignoreCase = true) }
+                    .distinctBy { it.lowercase(Locale.ROOT) }
+                val author = card.select(".mg_author .summary-content a").eachText()
+                    .map { it.trim() }.filter { it.isNotBlank() }.distinct().joinToString(", ").ifBlank { null }
+                val artist = card.select(".mg_artists .summary-content a").eachText()
+                    .map { it.trim() }.filter { it.isNotBlank() }.distinct().joinToString(", ").ifBlank { null }
+                val genres = card.select(".mg_genres a, .manga-genre-list a").eachText()
+                    .map { it.trim() }.filter { it.isNotBlank() }.distinct().joinToString(", ").ifBlank { null }
+                val status = parseExplicitStatus(card.selectFirst(".mg_status .summary-content")?.text())
+
+                if (names.isNotEmpty() || author != null || artist != null || genres != null || status != null) {
+                    candidate = SearchCardInfo(
+                        names = names.ifEmpty { candidate?.names.orEmpty() },
+                        author = author ?: candidate?.author,
+                        artist = artist ?: candidate?.artist,
+                        genre = genres ?: candidate?.genre,
+                        status = status ?: candidate?.status,
+                    )
+                }
+                if (card.hasClass("c-tabs-item__content") || card.hasClass("manga-item")) break
                 card = card.parent()
             }
+            if (candidate != null) return candidate
         }
-        return emptyList()
+        return null
+    }
+
+    private fun parseExplicitStatus(value: String?): Int? = when {
+        value.isNullOrBlank() -> null
+        Regex("(?i)\\b(completed|complete|finished)\\b").containsMatchIn(value) -> SManga.COMPLETED
+        Regex("(?i)\\b(ongoing|on-going|updating)\\b").containsMatchIn(value) -> SManga.ONGOING
+        else -> null
+    }
+
+    private fun applySearchCardInfo(manga: SManga, info: SearchCardInfo?) {
+        if (info == null) return
+        info.author?.let { manga.author = it }
+        info.artist?.let { manga.artist = it }
+        info.genre?.let { manga.genre = it }
+        info.status?.let { manga.status = it }
     }
 
     // The site's search cards display comma-separated names. Legacy saved
@@ -360,7 +409,9 @@ abstract class KensScan :
         val query = URLEncoder.encode(manga.title, "UTF-8")
         val searchDoc = client.get("$baseUrl/?s=$query&post_type=wp-manga&m_orderby=latest").asJsoup()
         val path = getMangaUrl(manga).toHttpUrl().encodedPath
-        alternativeNamesFromSearchResult(searchDoc, path, manga.title)
+        val card = searchCardInfo(searchDoc, path, manga.title)
+        applySearchCardInfo(manga, card)
+        card?.names.orEmpty()
     } catch (e: CancellationException) {
         throw e
     } catch (_: Exception) {
@@ -372,6 +423,11 @@ abstract class KensScan :
 
     private suspend fun detailWithSearchNames(doc: Document, oldManga: SManga? = null): SManga {
         val manga = detailFromDocument(doc)
+        // Don't erase previously fetched metadata when no extra search runs.
+        manga.author = oldManga?.author
+        manga.artist = oldManga?.artist
+        if (manga.genre.isNullOrBlank()) manga.genre = oldManga?.genre
+        if (manga.status == SManga.UNKNOWN) oldManga?.status?.let { manga.status = it }
         val savedNames = savedAlternativeNames(oldManga?.description)
         val pageNames = savedAlternativeNames(manga.description)
         val allKnown = (pageNames + savedNames)
@@ -480,12 +536,14 @@ abstract class KensScan :
                 formatAlternativeNames(alternateNames),
             ).joinToString("\n\n")
         }
-        val text = doc.text()
-        status = when {
-            Regex("(?i)\\bcompleted\\b").containsMatchIn(text) -> SManga.COMPLETED
-            Regex("(?i)\\bongoing\\b").containsMatchIn(text) -> SManga.ONGOING
-            else -> SManga.UNKNOWN
-        }
+        // Only read this series' status; related titles on the same page may
+        // contain words such as "Completed" or "Ongoing".
+        val statusText = doc.selectFirst(".mg_status .summary-content")?.text()
+            ?: doc.select(".post-content_item").firstNotNullOfOrNull { row ->
+                val heading = row.selectFirst(".summary-heading")?.text()?.trim()
+                if (heading.equals("Status", ignoreCase = true)) row.selectFirst(".summary-content")?.text() else null
+            }
+        status = parseExplicitStatus(statusText) ?: SManga.UNKNOWN
     }
 
     private fun parseChapterDate(a: Element): Long {
