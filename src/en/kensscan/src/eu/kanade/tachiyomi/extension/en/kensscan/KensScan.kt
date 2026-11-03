@@ -50,6 +50,9 @@ import java.util.Locale
 abstract class KensScan :
     KeiSource(),
     ConfigurableSource {
+    // Required by KeiSource to fetch and expose site-defined genre filters.
+    override val supportsFilterFetching = true
+
     private val preferences by getPreferencesLazy()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -138,9 +141,9 @@ abstract class KensScan :
     private class SortFilter :
         Filter.Select<String>(
             "Order by",
-            arrayOf("Latest", "A-Z", "Most Bookmarked", "Trending", "Most Views", "New", "Rating", "Relevance"),
+            arrayOf("Latest", "A-Z", "Most Bookmarked", "Trending", "Most Views", "New", "Relevance"),
         ) {
-        val key: String get() = arrayOf("latest", "alphabet", "bookmarks", "trending", "views", "new-manga", "rating", "")[state]
+        val key: String get() = arrayOf("latest", "alphabet", "bookmarks", "trending", "views", "new-manga", "")[state]
     }
 
     private class TextSearchFilter(name: String, val param: String) : Filter.Text(name)
@@ -209,7 +212,7 @@ abstract class KensScan :
 
         // Preserve the custom source's existing no-filter catalogue Browse and
         // sorting, including Popular ranking and zero additional network work.
-        if (query.isBlank() && !hasAdvancedFilters) return listing(page, order.ifBlank { "latest" })
+        if (query.isBlank() && !hasAdvancedFilters && order.isNotBlank()) return listing(page, order)
 
         // Use the official site's search endpoint when advanced filters are in
         // use. Never run the unfiltered catalogue fallback for filtered results.
